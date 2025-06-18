@@ -2,80 +2,96 @@ from datetime import datetime, timedelta
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 import pytesseract
-from PIL import Image
 import cv2
 import pytz
 import re
+import os
 
 # Configurações
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 TZ = pytz.timezone('America/Sao_Paulo')
 
-# Mapeamento de dias da semana (colunas da grade)
-COLUNAS = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sab']
-DIAS = {dia: i for i, dia in enumerate(COLUNAS)}
+# Dias da semana em ordem esperada da imagem
+DIAS = ['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sab', 'Dom']
 
+# Converte texto de horário para tupla (inicio, fim)
+def converter_horario(txt):
+    txt = txt.replace('–', '-').replace('—', '-').strip()
+    partes = re.split(r'\s*-\s*', txt)
+    return partes if len(partes) == 2 else None
+
+# Autentica e retorna o serviço do Google Calendar
 def get_calendar_service():
     flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
     creds = flow.run_local_server(port=0)
     return build('calendar', 'v3', credentials=creds)
 
-def converter_horario(txt):
-    """Converte faixa de horário em início e fim (ex: '07:30 - 08:25')"""
-    partes = re.split(r'\s*[-–]\s*', txt.strip())
-    if len(partes) == 2:
-        return partes[0], partes[1]
-    return None, None
+# Lê e extrai a grade da imagem
+def extrair_grade(path_img):
+    if not os.path.exists(path_img):
+        print(f"⚠️ Arquivo {path_img} não encontrado!")
+        return []
 
-def extrair_grade(imagem_path):
-    img = cv2.imread(imagem_path)
+    img = cv2.imread(path_img)
     if img is None:
-        raise FileNotFoundError(f"Imagem '{imagem_path}' não encontrada ou inválida.")
-    
+        print("⚠️ Erro ao ler imagem com OpenCV.")
+        return []
+
+    # Pré-processamento para melhorar OCR
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    text = pytesseract.image_to_string(gray)
+    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
+    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
 
-    # Substitui hífens estranhos por traço normal
-    text = text.replace('–', '-').replace('—', '-')
+    # OCR com Tesseract
+    config = r'--psm 6 -l por'
+    text = pytesseract.image_to_string(thresh, config=config)
 
-    linhas = text.splitlines()
-    grade = []
+    print("\n=== TEXTO OCR ===\n")
+    print(text)
+    print("\n=== FIM OCR ===\n")
+
+    linhas = [l.strip() for l in text.splitlines() if l.strip()]
+    blocos = []
 
     for linha in linhas:
-        # Identifica linhas com horário do tipo "07:30 - 08:25"
-        match_horario = re.match(r'^(\d{2}:\d{2})\s*[-]\s*(\d{2}:\d{2})', linha)
-        if not match_horario:
-            continue
-
-        hora_ini, hora_fim = match_horario.groups()
-
-        # Remove o horário inicial da linha e separa por múltiplos espaços
-        restante = linha[match_horario.end():].strip()
-        colunas = re.split(r'\s{2,}', restante)
-
-        for i, val in enumerate(colunas):
-            val = val.strip()
-            if not val or val == '---' or i >= len(COLUNAS):
+        if re.match(r'^\d{2}:\d{2}\s*[-–]\s*\d{2}:\d{2}', linha):
+            # divide por "—" ou traços grandes
+            partes = [p.strip() for p in re.split(r'[—|–]+', linha) if p.strip()]
+            faixa = converter_horario(partes[0]) if partes else None
+            if not faixa:
                 continue
 
-            dia_semana = DIAS[COLUNAS[i]]
-            # Extrai somente as 3 primeiras letras maiúsculas do código
-            codigo_match = re.match(r'([A-Z]{3})', val)
-            if not codigo_match:
-                continue
-            codigo = codigo_match.group(1)
-            grade.append((dia_semana, hora_ini, hora_fim, codigo))
-    return grade
+            colunas = partes[1:]
+            for i, val in enumerate(colunas):
+                val = val.upper()
+                if not val or '---' in val or i >= 7:
+                    continue
 
+                codigo = re.sub(r'[^A-Z]', '', val)[:3]  # só letras
+                blocos.append((i, faixa[0], faixa[1], codigo))  # i é o dia da semana
 
+    # Agrupa blocos consecutivos da mesma matéria
+    blocos.sort()
+    agrupados = []
+    for bloco in blocos:
+        if not agrupados:
+            agrupados.append(bloco)
+        else:
+            d, h_ini, h_fim, cod = bloco
+            d2, h2_ini, h2_fim, cod2 = agrupados[-1]
+            if d == d2 and cod == cod2 and h_ini == h2_fim:
+                agrupados[-1] = (d, h2_ini, h_fim, cod)
+            else:
+                agrupados.append(bloco)
+
+    return agrupados
+
+# Cria eventos no calendário com repetição semanal
 def criar_eventos(service, data_inicio, data_fim, grade):
     for dia, hora_ini, hora_fim, codigo in grade:
         dt = data_inicio
-
-        # Encontra o primeiro dia correto
         while dt.weekday() != dia:
             dt += timedelta(days=1)
-
         while dt <= data_fim:
             inicio = TZ.localize(datetime.strptime(f"{dt.strftime('%Y-%m-%d')} {hora_ini}", "%Y-%m-%d %H:%M"))
             fim = TZ.localize(datetime.strptime(f"{dt.strftime('%Y-%m-%d')} {hora_fim}", "%Y-%m-%d %H:%M"))
@@ -92,10 +108,8 @@ def criar_eventos(service, data_inicio, data_fim, grade):
             print(f"Criado: {codigo} em {inicio}")
             dt += timedelta(days=7)
 
-# Execução principal
+# Execução
 if __name__ == '__main__':
-    imagem = "horarios.png"  # Certifique-se de que o arquivo está no mesmo diretório
-
     data_ini_str = input("Digite a data de início (dd/mm/aaaa): ").strip()
     data_fim_str = input("Digite a data de fim    (dd/mm/aaaa): ").strip()
 
@@ -103,11 +117,10 @@ if __name__ == '__main__':
     data_fim = datetime.strptime(data_fim_str, "%d/%m/%Y")
 
     print("Lendo imagem...")
-    grade = extrair_grade(imagem)
+    grade = extrair_grade("horarios.png")
 
     print(f"{len(grade)} blocos de aula encontrados.")
     print("Conectando ao Google Calendar...")
     service = get_calendar_service()
     print("Criando eventos...")
-
     criar_eventos(service, data_inicio, data_fim, grade)
